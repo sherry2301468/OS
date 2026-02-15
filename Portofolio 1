@@ -1,0 +1,350 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <fstream>
+#include <cstdlib>
+#include <cstring>
+
+#include <unistd.h>     // chdir, getcwd, fork, execvp, dup, dup2
+#include <sys/wait.h>   // waitpid
+#include <dirent.h>     // directory handling
+#include <fcntl.h>      // open for redirection
+#include <errno.h>
+
+extern char **environ;
+
+using std::string;
+using std::vector;
+
+/*
+ * Structure used to store a parsed command line.
+ * Holds arguments and information about redirection/background execution.
+ */
+struct Job {
+    vector<string> args;
+    string inPath;
+    string outPath;
+    bool append = false;
+    bool bg = false;
+};
+
+/* Get current working directory as a string */
+static string getCwd() {
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) return "";
+    return string(buf);
+}
+
+/* Update the PWD environment variable */
+static void ensurePwd() {
+    string cwd = getCwd();
+    if (!cwd.empty()) setenv("PWD", cwd.c_str(), 1);
+}
+
+/* Split input line into tokens (spaces/tabs collapsed automatically) */
+static vector<string> tokenize(const string &line) {
+    std::istringstream iss(line);
+    vector<string> t;
+    string w;
+    while (iss >> w) t.push_back(w);
+    return t;
+}
+
+/*
+ * Parse the command line and detect:
+ *   < input redirection
+ *   > output redirection
+ *   >> append output
+ *   & background execution
+ */
+static Job parseLine(const string &line) {
+    Job j;
+    auto t = tokenize(line);
+
+    for (size_t i = 0; i < t.size(); i++) {
+        if (t[i] == "<" && i + 1 < t.size()) {
+            j.inPath = t[++i];
+        } else if (t[i] == ">" && i + 1 < t.size()) {
+            j.outPath = t[++i];
+            j.append = false;
+        } else if (t[i] == ">>" && i + 1 < t.size()) {
+            j.outPath = t[++i];
+            j.append = true;
+        } else if (t[i] == "&") {
+            j.bg = true;
+        } else {
+            j.args.push_back(t[i]);
+        }
+    }
+    return j;
+}
+
+/* ================= Built-in commands ================= */
+
+/* cd command: change directory or print current directory */
+static void builtin_cd(const vector<string> &args) {
+    if (args.size() == 1) {
+        std::cout << getCwd() << "\n";
+        return;
+    }
+
+    if (chdir(args[1].c_str()) != 0) {
+        std::cerr << "cd: " << strerror(errno) << "\n";
+        return;
+    }
+
+    ensurePwd(); // update PWD variable
+}
+
+/* dir command: list contents of a directory */
+static void builtin_dir(const vector<string> &args) {
+    string path = (args.size() >= 2) ? args[1] : ".";
+    DIR *d = opendir(path.c_str());
+    if (!d) {
+        std::cerr << "dir: " << strerror(errno) << "\n";
+        return;
+    }
+
+    dirent *e;
+    while ((e = readdir(d)) != nullptr) {
+        std::cout << e->d_name << "\n";
+    }
+    closedir(d);
+}
+
+/* Print all environment variables */
+static void builtin_environ() {
+    for (char **p = environ; *p; ++p) {
+        std::cout << *p << "\n";
+    }
+}
+
+/* set VARIABLE VALUE */
+static void builtin_set(const vector<string> &args) {
+    if (args.size() < 3) {
+        std::cerr << "set: usage: set VARIABLE VALUE\n";
+        return;
+    }
+
+    // join remaining tokens as value
+    string value = args[2];
+    for (size_t i = 3; i < args.size(); i++)
+        value += " " + args[i];
+
+    setenv(args[1].c_str(), value.c_str(), 1);
+}
+
+/* echo command */
+static void builtin_echo(const vector<string> &args) {
+    for (size_t i = 1; i < args.size(); i++) {
+        if (i > 1) std::cout << " ";
+        std::cout << args[i];
+    }
+    std::cout << "\n";
+}
+
+/* Write help text to a stream (used by more or stdout) */
+static void writeHelpText(FILE *out) {
+    const char *text =
+        "MyShell - simple OS coursework shell\n"
+        "-----------------------------------\n"
+        "Built-in commands:\n"
+        "  cd [DIR]\n"
+        "  dir DIRECTORY\n"
+        "  environ\n"
+        "  set VAR VALUE\n"
+        "  echo TEXT\n"
+        "  help\n"
+        "  pause\n"
+        "  quit\n"
+        "\n"
+        "Supports: <  >  >>  &\n";
+
+    fputs(text, out);
+}
+
+/*
+ * help command
+ * Uses 'more' filter if output is a terminal.
+ * If output is redirected, prints normally.
+ */
+static void builtin_help() {
+    if (isatty(STDOUT_FILENO)) {
+        FILE *pipe = popen("more", "w");
+        if (!pipe) {
+            writeHelpText(stdout);
+            return;
+        }
+        writeHelpText(pipe);
+        pclose(pipe);
+    } else {
+        writeHelpText(stdout);
+    }
+}
+
+/* pause command */
+static void builtin_pause() {
+    std::cout << "Press Enter to continue...";
+    std::cout.flush();
+    std::string dummy;
+    std::getline(std::cin, dummy);
+}
+
+/* ================= Redirection helpers ================= */
+
+/* Open input file for < redirection */
+static int openInput(const string &path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0)
+        std::cerr << "input redirection: " << strerror(errno) << "\n";
+    return fd;
+}
+
+/* Open output file for > or >> redirection */
+static int openOutput(const string &path, bool append) {
+    int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+    int fd = open(path.c_str(), flags, 0644);
+    if (fd < 0)
+        std::cerr << "output redirection: " << strerror(errno) << "\n";
+    return fd;
+}
+
+/*
+ * Redirect stdout temporarily for built-in commands.
+ * We save original stdout so it can be restored later.
+ */
+static bool redirectStdoutForBuiltin(const Job &j, int &savedStdout) {
+    if (j.outPath.empty()) return false;
+
+    int outFd = openOutput(j.outPath, j.append);
+    if (outFd < 0) return false;
+
+    savedStdout = dup(STDOUT_FILENO);
+    dup2(outFd, STDOUT_FILENO);
+    close(outFd);
+
+    return true;
+}
+
+/* Restore original stdout after built-in finishes */
+static void restoreStdout(int savedStdout) {
+    if (savedStdout >= 0) {
+        dup2(savedStdout, STDOUT_FILENO);
+        close(savedStdout);
+    }
+}
+
+/* ================= External program execution ================= */
+
+static void runExternal(const Job &j) {
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        // child process
+
+        if (!j.inPath.empty()) {
+            int inFd = openInput(j.inPath);
+            dup2(inFd, STDIN_FILENO);
+            close(inFd);
+        }
+
+        if (!j.outPath.empty()) {
+            int outFd = openOutput(j.outPath, j.append);
+            dup2(outFd, STDOUT_FILENO);
+            close(outFd);
+        }
+
+        // convert vector<string> to char* array for execvp
+        vector<char*> argv;
+        for (const auto &s : j.args)
+            argv.push_back(const_cast<char*>(s.c_str()));
+        argv.push_back(nullptr);
+
+        execvp(argv[0], argv.data());
+
+        // reached only if exec fails
+        std::cerr << "exec failed\n";
+        _exit(1);
+    }
+
+    // parent process
+    if (j.bg)
+        std::cout << "[started pid " << pid << "]\n";
+    else
+        waitpid(pid, nullptr, 0);
+}
+
+/* Check and run built-in commands */
+static bool handleBuiltins(const Job &j) {
+    const string &cmd = j.args[0];
+
+    if (cmd == "cd") { builtin_cd(j.args); return true; }
+    if (cmd == "set") { builtin_set(j.args); return true; }
+    if (cmd == "pause") { builtin_pause(); return true; }
+
+    // built-ins supporting output redirection
+    if (cmd == "dir" || cmd == "environ" || cmd == "echo" || cmd == "help") {
+        int saved = -1;
+        bool redirected = redirectStdoutForBuiltin(j, saved);
+
+        if (cmd == "dir") builtin_dir(j.args);
+        else if (cmd == "environ") builtin_environ();
+        else if (cmd == "echo") builtin_echo(j.args);
+        else if (cmd == "help") builtin_help();
+
+        if (redirected) restoreStdout(saved);
+        return true;
+    }
+
+    return false;
+}
+
+/* ================= Main shell loop ================= */
+
+int main(int argc, char *argv[]) {
+    ensurePwd();
+
+    // ensure PATH exists
+    if (!getenv("PATH"))
+        setenv("PATH", "/bin:/usr/bin", 1);
+
+    std::ifstream batch;
+    std::istream *in = &std::cin;
+
+    // batch mode support
+    if (argc == 2) {
+        batch.open(argv[1]);
+        if (!batch) {
+            std::cerr << "error: cannot open batch file\n";
+            return 1;
+        }
+        in = &batch;
+    }
+
+    while (true) {
+        // prompt shows current directory
+        if (in == &std::cin) {
+            std::cout << getCwd() << " $ ";
+            std::cout.flush();
+        }
+
+        string line;
+        if (!std::getline(*in, line)) break;
+
+        auto t = tokenize(line);
+        if (t.empty()) continue;
+        if (t[0][0] == '#') continue; // comment support
+
+        Job j = parseLine(line);
+        if (j.args.empty()) continue;
+
+        if (j.args[0] == "quit") break;
+
+        // built-in or external command
+        if (!handleBuiltins(j))
+            runExternal(j);
+    }
+
+    return 0;
+}
