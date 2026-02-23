@@ -1,0 +1,133 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <thread>
+#include <algorithm>
+#include <cctype>
+
+using namespace std;
+
+/*
+   Structure to hold data passed to each thread.
+   Each thread works on its own segment and local frequency map.
+   This avoids race conditions.
+*/
+struct ThreadData {
+    vector<string> words;                  // Words assigned to this thread
+    int thread_id;                         // Thread identifier
+    unordered_map<string, int> word_count; // Local frequency map
+};
+
+/*
+   Removes punctuation and converts word to lowercase.
+   Ensures consistent counting.
+*/
+string cleanWord(string word) {
+    string cleaned = "";
+    for (char c : word) {
+        if (isalnum(c)) {
+            cleaned += tolower(c);
+        }
+    }
+    return cleaned;
+}
+
+/*
+   Function executed by each thread.
+   Counts word frequency in its assigned segment.
+*/
+void countWords(ThreadData& data) {
+
+    for (string word : data.words) {
+        word = cleanWord(word);
+
+        if (!word.empty()) {
+            data.word_count[word]++;
+        }
+    }
+
+    // Print intermediate result of this thread
+    cout << "\nThread " << data.thread_id << " intermediate result:\n";
+    for (auto& pair : data.word_count) {
+        cout << pair.first << " : " << pair.second << endl;
+    }
+}
+
+int main() {
+
+    string filename = "sample.txt";
+    int N = 3;   // Number of threads
+
+    ifstream file(filename);
+
+    if (!file.is_open()) {
+        cout << "Error opening file.\n";
+        return 1;
+    }
+
+    vector<string> all_words;
+    string word;
+
+    // Read all words from file
+    while (file >> word) {
+        all_words.push_back(word);
+    }
+
+    file.close();
+
+    int total_words = all_words.size();
+    int segment_size = total_words / N;
+
+    vector<thread> threads;
+    vector<ThreadData> thread_data(N);
+
+    /*
+       Divide the words into N segments
+       and create N worker threads.
+    */
+    for (int i = 0; i < N; i++) {
+
+        int start = i * segment_size;
+        int end = (i == N - 1) ? total_words : (i + 1) * segment_size;
+
+        thread_data[i].words = vector<string>(
+            all_words.begin() + start,
+            all_words.begin() + end
+        );
+
+        thread_data[i].thread_id = i;
+
+        // Create thread and pass data by reference
+        threads.emplace_back(countWords, ref(thread_data[i]));
+    }
+
+    /*
+       Synchronization point:
+       Main thread waits for all worker threads to finish.
+    */
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    /*
+       Consolidation phase:
+       Merge all intermediate frequency maps
+       into one final result.
+    */
+    unordered_map<string, int> final_count;
+
+    for (int i = 0; i < N; i++) {
+        for (auto& pair : thread_data[i].word_count) {
+            final_count[pair.first] += pair.second;
+        }
+    }
+
+    cout << "\nFinal Consolidated Word Frequency:\n";
+    for (auto& pair : final_count) {
+        cout << pair.first << " : " << pair.second << endl;
+    }
+
+    return 0;
+}
